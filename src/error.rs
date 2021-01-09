@@ -5,19 +5,6 @@ use std::{borrow::Cow, error::Error as ErrorTrait, fmt, io, result, str, string}
 use crate::protocol::Message;
 use http::Response;
 
-#[cfg(feature = "use-native-tls")]
-pub mod tls {
-    //! TLS error wrapper module, feature-gated.
-    pub use native_tls::Error;
-}
-
-#[cfg(feature = "use-rustls")]
-pub mod tls {
-    //! TLS error wrapper module, feature-gated.
-    pub use rustls::TLSError as Error;
-    pub use webpki::InvalidDNSNameError as DnsError;
-}
-
 /// Result type of all Tungstenite library calls.
 pub type Result<T> = result::Result<T, Error>;
 
@@ -47,15 +34,12 @@ pub enum Error {
     /// Input-output error. Apart from WouldBlock, these are generally errors with the
     /// underlying connection and you should probably consider them fatal.
     Io(io::Error),
-    #[cfg(feature = "use-native-tls")]
+    #[cfg(any(feature = "use-native-tls", feature = "use-rustls"))]
     /// TLS error
-    Tls(tls::Error),
-    #[cfg(feature = "use-rustls")]
-    /// TLS error
-    Tls(tls::Error),
+    Tls(TlsError),
     #[cfg(feature = "use-rustls")]
     /// DNS name resolution error.
-    Dns(tls::DnsError),
+    Dns(webpki::InvalidDNSNameError),
     /// - When reading: buffer capacity exhausted.
     /// - When writing: your message is bigger than the configured max message size
     ///   (64MB by default).
@@ -80,9 +64,7 @@ impl fmt::Display for Error {
             Error::ConnectionClosed => write!(f, "Connection closed normally"),
             Error::AlreadyClosed => write!(f, "Trying to work with closed connection"),
             Error::Io(ref err) => write!(f, "IO error: {}", err),
-            #[cfg(feature = "use-native-tls")]
-            Error::Tls(ref err) => write!(f, "TLS error: {}", err),
-            #[cfg(feature = "use-rustls")]
+            #[cfg(any(feature = "use-native-tls", feature = "use-rustls"))]
             Error::Tls(ref err) => write!(f, "TLS error: {}", err),
             #[cfg(feature = "use-rustls")]
             Error::Dns(ref err) => write!(f, "Invalid DNS name: {}", err),
@@ -154,22 +136,22 @@ impl From<http::Error> for Error {
 }
 
 #[cfg(feature = "use-native-tls")]
-impl From<tls::Error> for Error {
-    fn from(err: tls::Error) -> Self {
-        Error::Tls(err)
+impl From<native_tls::Error> for Error {
+    fn from(err: native_tls::Error) -> Self {
+        Error::Tls(TlsError::NativeTls(err))
     }
 }
 
 #[cfg(feature = "use-rustls")]
-impl From<tls::Error> for Error {
-    fn from(err: tls::Error) -> Self {
-        Error::Tls(err)
+impl From<rustls::TLSError> for Error {
+    fn from(err: rustls::TLSError) -> Self {
+        Error::Tls(TlsError::Rustls(err))
     }
 }
 
 #[cfg(feature = "use-rustls")]
-impl From<tls::DnsError> for Error {
-    fn from(err: tls::DnsError) -> Self {
+impl From<webpki::InvalidDNSNameError> for Error {
+    fn from(err: webpki::InvalidDNSNameError) -> Self {
         Error::Dns(err)
     }
 }
@@ -182,3 +164,36 @@ impl From<httparse::Error> for Error {
         }
     }
 }
+
+/// Possible TLS related error that depends on the backend used.
+#[allow(missing_copy_implementations)]
+#[derive(Debug)]
+pub enum TlsError {
+    #[cfg(feature = "use-native-tls")]
+    /// TLS error from the `native-tls` crate.
+    NativeTls(native_tls::Error),
+    #[cfg(feature = "use-rustls")]
+    /// TLS error from the `rustls` crate.
+    Rustls(rustls::TLSError),
+}
+
+#[cfg(any(feature = "use-native-tls", feature = "use-rustls"))]
+impl fmt::Display for TlsError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            #[cfg(feature = "use-native-tls")]
+            Self::NativeTls(err) => write!(f, "{}", err),
+            #[cfg(feature = "use-rustls")]
+            Self::Rustls(err) => write!(f, "{}", err),
+        }
+    }
+}
+
+#[cfg(not(any(feature = "use-native-tls", feature = "use-rustls")))]
+impl fmt::Display for TlsError {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
+}
+
+impl ErrorTrait for TlsError {}

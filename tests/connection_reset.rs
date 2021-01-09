@@ -10,13 +10,10 @@ use std::{
 };
 
 use net2::TcpStreamExt;
-use tungstenite::{accept, connect, stream::Stream, Error, Message, WebSocket};
+use tungstenite::{accept, client::tls, connect, Error, Message, WebSocket};
 use url::Url;
 
-#[cfg(feature = "use-native-tls")]
-type Sock = WebSocket<Stream<TcpStream, native_tls::TlsStream<TcpStream>>>;
-#[cfg(feature = "use-rustls")]
-type Sock = WebSocket<Stream<TcpStream, rustls::StreamOwned<rustls::ClientSession, TcpStream>>>;
+type Sock = WebSocket<tls::AutoStream>;
 
 fn do_test<CT, ST>(port: u16, client_task: CT, server_task: ST)
 where

@@ -6,109 +6,32 @@ use std::{
     result::Result as StdResult,
 };
 
+use cfg_if::cfg_if;
 use http::{request::Parts, Uri};
 use log::*;
-
 use url::Url;
 
 use crate::{
-    handshake::client::{Request, Response},
-    protocol::WebSocketConfig,
-};
-
-#[cfg(feature = "use-native-tls")]
-mod encryption {
-    pub use native_tls::TlsStream;
-    use native_tls::{HandshakeError as TlsHandshakeError, TlsConnector};
-    use std::net::TcpStream;
-
-    pub use crate::stream::Stream as StreamSwitcher;
-    /// TCP stream switcher (plain/TLS).
-    pub type AutoStream = StreamSwitcher<TcpStream, TlsStream<TcpStream>>;
-
-    use crate::{error::Result, stream::Mode};
-
-    pub fn wrap_stream(stream: TcpStream, domain: &str, mode: Mode) -> Result<AutoStream> {
-        match mode {
-            Mode::Plain => Ok(StreamSwitcher::Plain(stream)),
-            Mode::Tls => {
-                let connector = TlsConnector::builder().build()?;
-                connector
-                    .connect(domain, stream)
-                    .map_err(|e| match e {
-                        TlsHandshakeError::Failure(f) => f.into(),
-                        TlsHandshakeError::WouldBlock(_) => {
-                            panic!("Bug: TLS handshake not blocked")
-                        }
-                    })
-                    .map(StreamSwitcher::Tls)
-            }
-        }
-    }
-}
-
-#[cfg(feature = "use-rustls")]
-mod encryption {
-    use rustls::ClientConfig;
-    pub use rustls::{ClientSession, StreamOwned};
-    use std::{net::TcpStream, sync::Arc};
-    use webpki::DNSNameRef;
-
-    pub use crate::stream::Stream as StreamSwitcher;
-    /// TCP stream switcher (plain/TLS).
-    pub type AutoStream = StreamSwitcher<TcpStream, StreamOwned<ClientSession, TcpStream>>;
-
-    use crate::{error::Result, stream::Mode};
-
-    pub fn wrap_stream(stream: TcpStream, domain: &str, mode: Mode) -> Result<AutoStream> {
-        match mode {
-            Mode::Plain => Ok(StreamSwitcher::Plain(stream)),
-            Mode::Tls => {
-                let config = {
-                    let mut config = ClientConfig::new();
-                    config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
-
-                    Arc::new(config)
-                };
-                let domain = DNSNameRef::try_from_ascii_str(domain)?;
-                let client = ClientSession::new(&config, domain);
-                let stream = StreamOwned::new(client, stream);
-
-                Ok(StreamSwitcher::Tls(stream))
-            }
-        }
-    }
-}
-
-#[cfg(not(any(feature = "use-native-tls", feature = "use-rustls")))]
-mod encryption {
-    use std::net::TcpStream;
-
-    use crate::{
-        error::{Error, Result},
-        stream::Mode,
-    };
-
-    /// TLS support is nod compiled in, this is just standard `TcpStream`.
-    pub type AutoStream = TcpStream;
-
-    pub fn wrap_stream(stream: TcpStream, _domain: &str, mode: Mode) -> Result<AutoStream> {
-        match mode {
-            Mode::Plain => Ok(stream),
-            Mode::Tls => Err(Error::Url("TLS support not compiled in.".into())),
-        }
-    }
-}
-
-use self::encryption::wrap_stream;
-pub use self::encryption::AutoStream;
-
-use crate::{
     error::{Error, Result},
+    handshake::client::{Request, Response},
     handshake::{client::ClientHandshake, HandshakeError},
     protocol::WebSocket,
+    protocol::WebSocketConfig,
     stream::{Mode, NoDelay},
 };
+
+cfg_if! {
+    if #[cfg(any(feature = "use-native-tls", feature = "use-rustls"))] {
+        pub use self::tls::{AutoStream, TlsWrapper};
+    } else {
+        pub use std::net::TcpStream as AutoStream;
+
+        use self::plain::TlsWrapper;
+    }
+}
+
+mod plain;
+pub mod tls;
 
 /// Connect to the given WebSocket in blocking mode.
 ///
@@ -129,10 +52,14 @@ pub fn connect_with_config<Req: IntoClientRequest>(
     request: Req,
     config: Option<WebSocketConfig>,
     max_redirects: u8,
+    #[cfg(any(feature = "use-native-tls", feature = "use-rustls"))] wrapper: &impl TlsWrapper<
+        Stream = AutoStream,
+    >,
 ) -> Result<(WebSocket<AutoStream>, Response)> {
     fn try_client_handshake(
         request: Request,
         config: Option<WebSocketConfig>,
+        wrapper: &impl TlsWrapper<Stream = AutoStream>,
     ) -> Result<(WebSocket<AutoStream>, Response)> {
         let uri = request.uri();
         let mode = uri_mode(uri)?;
@@ -143,7 +70,7 @@ pub fn connect_with_config<Req: IntoClientRequest>(
             Mode::Tls => 443,
         });
         let addrs = (host, port).to_socket_addrs()?;
-        let mut stream = connect_to_some(addrs.as_slice(), &request.uri(), mode)?;
+        let mut stream = connect_to_some(addrs.as_slice(), &request.uri(), mode, wrapper)?;
         NoDelay::set_nodelay(&mut stream, true)?;
         client_with_config(request, stream, config).map_err(|e| match e {
             HandshakeError::Failure(f) => f,
@@ -161,10 +88,13 @@ pub fn connect_with_config<Req: IntoClientRequest>(
     let (parts, _) = request.into_client_request()?.into_parts();
     let mut uri = parts.uri.clone();
 
+    #[cfg(not(any(feature = "use-native-tls", feature = "use-rustls")))]
+    let wrapper = &plain::Wrapper;
+
     for attempt in 0..(max_redirects + 1) {
         let request = create_request(&parts, &uri);
 
-        match try_client_handshake(request, config) {
+        match try_client_handshake(request, config, wrapper) {
             Err(Error::Http(res)) if res.status().is_redirection() && attempt < max_redirects => {
                 if let Some(location) = res.headers().get("Location") {
                     uri = location.to_str()?.parse::<Uri>()?;
@@ -194,16 +124,56 @@ pub fn connect_with_config<Req: IntoClientRequest>(
 /// This function uses `native_tls` to do TLS. If you want to use other TLS libraries,
 /// use `client` instead. There is no need to enable the "tls" feature if you don't call
 /// `connect` since it's the only function that uses native_tls.
-pub fn connect<Req: IntoClientRequest>(request: Req) -> Result<(WebSocket<AutoStream>, Response)> {
-    connect_with_config(request, None, 3)
+pub fn connect<Req: IntoClientRequest>(
+    request: Req,
+) -> Result<(WebSocket<AutoStream>, Response)> {
+    cfg_if! {
+        if #[cfg(any(feature = "use-native-tls", feature="use-rustls"))] {
+            cfg_if! {
+                if #[cfg(feature = "use-native-tls")] {
+                    use tls::NativeTlsWrapper as Wrapper;
+                } else if #[cfg(feature = "use-rustls")] {
+                    use tls::RustlsWrapper as Wrapper;
+                }
+            }
+            connect_with_config(request, None, 3, &Wrapper)
+        } else {
+            connect_with_config(request, None, 3)
+        }
+    }
 }
 
-fn connect_to_some(addrs: &[SocketAddr], uri: &Uri, mode: Mode) -> Result<AutoStream> {
+/// Connect to the given WebSocket in blocking mode.
+///
+/// The URL may be either ws:// or wss://.
+/// To support wss:// URLs, feature "tls" must be turned on.
+///
+/// This function "just works" for those who wants a simple blocking solution
+/// similar to `std::net::TcpStream`. If you want a non-blocking or other
+/// custom stream, call `client` instead.
+///
+/// This function uses `native_tls` to do TLS. If you want to use other TLS libraries,
+/// use `client` instead. There is no need to enable the "tls" feature if you don't call
+/// `connect` since it's the only function that uses native_tls.
+#[cfg(any(feature = "use-native-tls", feature = "use-rustls"))]
+pub fn connect_tls<Req: IntoClientRequest>(
+    request: Req,
+    wrapper: &impl TlsWrapper<Stream = AutoStream>,
+) -> Result<(WebSocket<AutoStream>, Response)> {
+    connect_with_config(request, None, 3, wrapper)
+}
+
+fn connect_to_some(
+    addrs: &[SocketAddr],
+    uri: &Uri,
+    mode: Mode,
+    wrapper: &impl TlsWrapper<Stream = AutoStream>,
+) -> Result<AutoStream> {
     let domain = uri.host().ok_or_else(|| Error::Url("No host name in the URL".into()))?;
     for addr in addrs {
         debug!("Trying to contact {} at {}...", uri, addr);
         if let Ok(raw_stream) = TcpStream::connect(addr) {
-            if let Ok(stream) = wrap_stream(raw_stream, domain, mode) {
+            if let Ok(stream) = wrapper.wrap_stream(raw_stream, domain, mode) {
                 return Ok(stream);
             }
         }
